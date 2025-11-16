@@ -1,0 +1,407 @@
+#include <Arduino.h>
+#include "AFMotor_R4.h"
+
+// ============================================================================
+// MOTOR CONFIGURATION
+// ============================================================================
+AF_DCMotor leftMotor(1);   // Left motor on M1
+AF_DCMotor rightMotor(2);  // Right motor on M2
+
+// ============================================================================
+// SENSOR CONFIGURATION
+// ============================================================================
+const int  SENSOR_PIN = 10;             // Digital sensor on servo header pin 10
+const bool SENSOR_ACTIVE_HIGH = true;   // true: 1=tape/dark, 0=floor/light
+
+// ============================================================================
+// SPEED CONFIGURATION
+// ============================================================================
+const int MAX_SPEED        = 255;  // Straight-line top speed
+const int SOFT_TURN_SPEED  = 190;  // Inner wheel speed during soft correction
+const int HARD_TURN_SPEED  = 140;  // Inner wheel speed during hard correction
+
+// ============================================================================
+// TIMING CONFIGURATION
+// ============================================================================
+// Correction timing
+const unsigned long SOFT_CORRECT_MIN_MS  = 60;   // Min time in soft correct
+const unsigned long HARD_CORRECT_TH_MS   = 250;  // On tape this long => HARD_CORRECT
+const unsigned long MIN_HARD_CORRECT_MS  = 120;  // Min time to stay in hard correct
+
+// Lost-line detection
+const unsigned long LOST_LINE_TH_MS      = 800;  // No tape for this long => LOST_LINE
+const unsigned long LOST_LINE_RECOVER_MS = 400;  // How long we spin/turn in LOST_LINE
+
+// Stage timing
+const unsigned long SENSOR_WARMUP_MS          = 3000;  // Stage 0
+const unsigned long COUNTDOWN_MS              = 2000;  // Stage 1
+const unsigned long SENSOR_PRINT_INTERVAL_MS  = 100;   // Debug prints in Stage 2
+const unsigned long FAST_BLINK_INTERVAL       = 200;   // Stage 0 LED blink
+const unsigned long SLOW_BLINK_INTERVAL       = 500;   // Stage 1 LED blink
+
+// Ramp-up for Stage 2
+const unsigned long RAMP_UP_MS                = 800;   // ms to ramp from 0 to MAX_SPEED
+
+// ============================================================================
+// DRIVE MODE STATE MACHINE
+// ============================================================================
+enum DriveMode {
+  DRIVE_STRAIGHT,
+  DRIVE_SOFT_CORRECT,
+  DRIVE_HARD_CORRECT,
+  DRIVE_LOST_LINE
+};
+
+DriveMode mode = DRIVE_STRAIGHT;
+
+// ============================================================================
+// GLOBAL TIMING VARIABLES
+// ============================================================================
+unsigned long bootTime          = 0;
+unsigned long lastLedToggleTime = 0;
+unsigned long lastSensorPrintTime = 0;
+unsigned long modeStartTime     = 0;  // when current mode started
+unsigned long tapeLastSeenTime  = 0;  // last time sensor saw tape
+unsigned long stage2StartTime   = 0;  // when Stage 2 started
+bool ledState = false;
+
+// ============================================================================
+// HELPER FUNCTION: Set Motor Speeds
+// ============================================================================
+void setMotorSpeeds(int leftSpeed, int rightSpeed) {
+  if (leftSpeed < 0) leftSpeed = 0;
+  if (leftSpeed > 255) leftSpeed = 255;
+  if (rightSpeed < 0) rightSpeed = 0;
+  if (rightSpeed > 255) rightSpeed = 255;
+
+  leftMotor.setSpeed(leftSpeed);
+  rightMotor.setSpeed(rightSpeed);
+
+  leftMotor.run(FORWARD);
+  rightMotor.run(FORWARD);
+}
+
+// ============================================================================
+// HELPER FUNCTION: Get Mode Name String
+// ============================================================================
+const char* modeToString(DriveMode m) {
+  switch (m) {
+    case DRIVE_STRAIGHT:      return "STRAIGHT";
+    case DRIVE_SOFT_CORRECT:  return "SOFT_CORRECT";
+    case DRIVE_HARD_CORRECT:  return "HARD_CORRECT";
+    case DRIVE_LOST_LINE:     return "LOST_LINE";
+    default:                  return "UNKNOWN";
+  }
+}
+
+// ============================================================================
+// SETUP
+// ============================================================================
+void setup() {
+  // Initialize Serial
+  Serial.begin(9600);
+  delay(300);
+  
+  // Print Phase 5 banner
+  Serial.println("================================================");
+  Serial.println("  Phase 5: Advanced Line Following Robot");
+  Serial.println("  Soft/Hard Correction + Lost Line Recovery");
+  Serial.println("================================================");
+  Serial.println();
+  Serial.println("Hardware:");
+  Serial.println("  - Left motor:  M1");
+  Serial.println("  - Right motor: M2");
+  Serial.println("  - Line sensor: Pin 10 (digital)");
+  Serial.println();
+  Serial.println("Drive Modes:");
+  Serial.println("  STRAIGHT      - Both motors at base/max speed");
+  Serial.println("  SOFT_CORRECT  - Gentle turn (inner @ 190)");
+  Serial.println("  HARD_CORRECT  - Sharp turn (inner @ 140)");
+  Serial.println("  LOST_LINE     - Recovery spin search");
+  Serial.println();
+  Serial.println("Stages:");
+  Serial.println("  Stage 0 (3s): Sensor warmup");
+  Serial.println("  Stage 1 (2s): Countdown");
+  Serial.println("  Stage 2:      Line-following with");
+  Serial.println("                soft/hard correction and");
+  Serial.println("                lost-line recovery");
+  Serial.println();
+  
+  // Initialize motor controller
+  initMotorController();
+  
+  // Initialize motors to stopped state
+  leftMotor.setSpeed(0);
+  rightMotor.setSpeed(0);
+  leftMotor.run(RELEASE);
+  rightMotor.run(RELEASE);
+  
+  // Configure sensor
+  pinMode(SENSOR_PIN, INPUT);
+  
+  // Configure LED
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH);
+  ledState = true;
+  
+  // Initialize timing
+  bootTime = millis();
+  lastLedToggleTime = bootTime;
+  lastSensorPrintTime = bootTime;
+  mode = DRIVE_STRAIGHT;
+  modeStartTime = bootTime;
+  tapeLastSeenTime = bootTime;
+  
+  Serial.println("Starting Stage 0: Sensor warmup (3 seconds)");
+  Serial.println();
+}
+
+// ============================================================================
+// MAIN LOOP
+// ============================================================================
+void loop() {
+  unsigned long now = millis();
+  unsigned long elapsed = now - bootTime;
+  
+  // ==========================================================================
+  // STAGE 0: SENSOR WARMUP (0-3000 ms)
+  // ==========================================================================
+  if (elapsed < SENSOR_WARMUP_MS) {
+    
+    // Motors OFF
+    static bool stage0MotorsInitialized = false;
+    if (!stage0MotorsInitialized) {
+      leftMotor.run(RELEASE);
+      rightMotor.run(RELEASE);
+      leftMotor.setSpeed(0);
+      rightMotor.setSpeed(0);
+      stage0MotorsInitialized = true;
+    }
+    
+    // Fast LED blink
+    if (now - lastLedToggleTime >= FAST_BLINK_INTERVAL) {
+      ledState = !ledState;
+      digitalWrite(LED_BUILTIN, ledState ? HIGH : LOW);
+      lastLedToggleTime = now;
+    }
+    
+    // Print sensor state for verification
+    static unsigned long lastWarmupPrint = 0;
+    if (now - lastWarmupPrint >= 250) {
+      int raw = digitalRead(SENSOR_PIN);
+      int onTape = SENSOR_ACTIVE_HIGH ? raw : !raw;
+      
+      Serial.print("Warmup: sensor = ");
+      Serial.print(raw);
+      Serial.print(" -> ");
+      Serial.println(onTape == 1 ? "TAPE/DARK" : "FLOOR/LIGHT");
+      
+      lastWarmupPrint = now;
+    }
+    
+    // Stage transition message
+    static bool warmupCompletePrinted = false;
+    if (elapsed >= SENSOR_WARMUP_MS - 100 && !warmupCompletePrinted) {
+      Serial.println();
+      Serial.println("Stage 0 complete: Sensor warmup done");
+      Serial.println();
+      warmupCompletePrinted = true;
+    }
+  }
+  
+  // ==========================================================================
+  // STAGE 1: COUNTDOWN (3000-5000 ms)
+  // ==========================================================================
+  else if (elapsed < SENSOR_WARMUP_MS + COUNTDOWN_MS) {
+    unsigned long countdownElapsed = elapsed - SENSOR_WARMUP_MS;
+    
+    // Print stage start message
+    static bool stage1StartPrinted = false;
+    if (!stage1StartPrinted) {
+      Serial.println("Stage 1: Countdown (2 seconds)");
+      Serial.println();
+      stage1StartPrinted = true;
+    }
+    
+    // Motors still OFF
+    static bool stage1MotorsInitialized = false;
+    if (!stage1MotorsInitialized) {
+      leftMotor.run(RELEASE);
+      rightMotor.run(RELEASE);
+      leftMotor.setSpeed(0);
+      rightMotor.setSpeed(0);
+      stage1MotorsInitialized = true;
+    }
+    
+    // Slow LED blink
+    if (now - lastLedToggleTime >= SLOW_BLINK_INTERVAL) {
+      ledState = !ledState;
+      digitalWrite(LED_BUILTIN, ledState ? HIGH : LOW);
+      lastLedToggleTime = now;
+    }
+    
+    // Print countdown messages
+    static bool countdown2Printed = false;
+    static bool countdown1Printed = false;
+    
+    if (countdownElapsed < 1000 && !countdown2Printed) {
+      Serial.println("Countdown: 2");
+      countdown2Printed = true;
+    }
+    else if (countdownElapsed >= 1000 && !countdown1Printed) {
+      Serial.println("Countdown: 1");
+      countdown1Printed = true;
+    }
+    
+    // Announce Stage 2 is coming
+    static bool stage2AnnouncePrinted = false;
+    if (countdownElapsed >= 1800 && !stage2AnnouncePrinted) {
+      Serial.println();
+      Serial.println("Entering Stage 2 shortly...");
+      stage2AnnouncePrinted = true;
+    }
+  }
+  
+  // ==========================================================================
+  // STAGE 2: LINE FOLLOWING (after 5000 ms)
+  // ==========================================================================
+  else {
+    
+    // Initialize Stage 2 once
+    static bool stage2Initialized = false;
+    if (!stage2Initialized) {
+      // LED solid ON
+      digitalWrite(LED_BUILTIN, HIGH);
+      
+      Serial.println();
+      Serial.println("================================================");
+      Serial.println("  Stage 2: Line Following Active!");
+      Serial.println("================================================");
+      Serial.println("Features:");
+      Serial.println("  - Smooth speed ramp-up (0 to MAX over 800ms)");
+      Serial.println("  - Soft correction -> Hard correction");
+      Serial.println("  - Lost-line recovery with spin search");
+      Serial.println();
+      
+      // Set Stage 2 timing
+      stage2StartTime = now;
+      mode = DRIVE_STRAIGHT;
+      modeStartTime = now;
+      tapeLastSeenTime = now;
+      
+      stage2Initialized = true;
+      lastSensorPrintTime = now;
+    }
+    
+    // --- 1. READ SENSOR ---
+    int raw = digitalRead(SENSOR_PIN);
+    int onTape = SENSOR_ACTIVE_HIGH ? raw : !raw;  // 1 = tape, 0 = floor
+    
+    if (onTape) {
+      tapeLastSeenTime = now;
+    }
+    
+    // --- 2. COMPUTE RAMPED BASE SPEED ---
+    unsigned long stage2Elapsed = now - stage2StartTime;
+    int baseSpeed;
+    
+    if (stage2Elapsed < RAMP_UP_MS) {
+      baseSpeed = map(stage2Elapsed, 0, RAMP_UP_MS, 0, MAX_SPEED);
+      baseSpeed = constrain(baseSpeed, 0, MAX_SPEED);
+    } else {
+      baseSpeed = MAX_SPEED;
+    }
+    
+    // --- 3. CHECK FOR LOST LINE ---
+    unsigned long timeSinceTape = now - tapeLastSeenTime;
+    
+    if (timeSinceTape >= LOST_LINE_TH_MS && mode != DRIVE_LOST_LINE) {
+      mode = DRIVE_LOST_LINE;
+      modeStartTime = now;
+      Serial.println(">> LOST_LINE: entering recovery mode");
+    }
+    
+    // --- 4. DRIVE MODE LOGIC ---
+    unsigned long inMode = now - modeStartTime;
+    
+    switch (mode) {
+      
+      case DRIVE_STRAIGHT:
+        // Both motors at baseSpeed
+        setMotorSpeeds(baseSpeed, baseSpeed);
+        
+        // Transition: saw tape
+        if (onTape == 1) {
+          mode = DRIVE_SOFT_CORRECT;
+          modeStartTime = now;
+          Serial.println(">> Mode: SOFT_CORRECT (saw tape)");
+        }
+        break;
+        
+      case DRIVE_SOFT_CORRECT:
+        // Gentle left turn
+        setMotorSpeeds(SOFT_TURN_SPEED, baseSpeed);
+        
+        // Transition: escalate to hard correction
+        if (onTape && inMode >= HARD_CORRECT_TH_MS) {
+          mode = DRIVE_HARD_CORRECT;
+          modeStartTime = now;
+          Serial.println(">> Mode: HARD_CORRECT (tape for long)");
+        }
+        // Transition: back to straight
+        else if (!onTape && inMode >= SOFT_CORRECT_MIN_MS) {
+          mode = DRIVE_STRAIGHT;
+          modeStartTime = now;
+          Serial.println(">> Mode: STRAIGHT (back on floor)");
+        }
+        break;
+        
+      case DRIVE_HARD_CORRECT:
+        // Stronger left turn
+        setMotorSpeeds(HARD_TURN_SPEED, baseSpeed);
+        
+        // After minimum time, check if we can exit
+        if (inMode >= MIN_HARD_CORRECT_MS) {
+          if (!onTape) {
+            mode = DRIVE_SOFT_CORRECT;
+            modeStartTime = now;
+            Serial.println(">> Mode: SOFT_CORRECT (exiting hard correct)");
+          }
+        }
+        break;
+        
+      case DRIVE_LOST_LINE:
+        // Recovery: spin in place (left forward, right backward)
+        leftMotor.setSpeed(HARD_TURN_SPEED);
+        rightMotor.setSpeed(HARD_TURN_SPEED);
+        leftMotor.run(FORWARD);
+        rightMotor.run(BACKWARD);
+        
+        // Transition: found tape
+        if (onTape == 1) {
+          mode = DRIVE_SOFT_CORRECT;
+          modeStartTime = now;
+          tapeLastSeenTime = now;
+          Serial.println(">> LOST_LINE: found tape, switching to SOFT_CORRECT");
+        }
+        // Still searching after recovery duration
+        else if (inMode >= LOST_LINE_RECOVER_MS) {
+          modeStartTime = now;  // Reset timer, keep searching
+          Serial.println(">> LOST_LINE: still searching...");
+        }
+        break;
+    }
+    
+    // --- 5. PRINT SENSOR + MODE (every 100ms) ---
+    if (now - lastSensorPrintTime >= SENSOR_PRINT_INTERVAL_MS) {
+      Serial.print("sensor = ");
+      Serial.print(raw);
+      Serial.print(" -> ");
+      Serial.print(onTape == 1 ? "TAPE" : "FLOOR");
+      Serial.print(", mode = ");
+      Serial.println(modeToString(mode));
+      
+      lastSensorPrintTime = now;
+    }
+  }
+}
