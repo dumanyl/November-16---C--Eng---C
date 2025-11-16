@@ -14,11 +14,12 @@ const int  SENSOR_PIN = 10;             // Digital sensor on servo header pin 10
 const bool SENSOR_ACTIVE_HIGH = true;   // true: 1=tape/dark, 0=floor/light
 
 // ============================================================================
-// SPEED CONFIGURATION
+// SPEED CONFIGURATION (ADJUSTED FOR BOTH MOTORS TO WORK)
 // ============================================================================
 const int MAX_SPEED        = 255;  // Straight-line top speed
-const int SOFT_TURN_SPEED  = 190;  // Inner wheel speed during soft correction
-const int HARD_TURN_SPEED  = 140;  // Inner wheel speed during hard correction
+const int SOFT_TURN_SPEED  = 220;  // Inner wheel speed during soft correction (INCREASED)
+const int HARD_TURN_SPEED  = 190;  // Inner wheel speed during hard correction (INCREASED)
+const int MIN_MOTOR_SPEED  = 150;  // Minimum speed to overcome friction
 
 // ============================================================================
 // TIMING CONFIGURATION
@@ -66,19 +67,39 @@ unsigned long stage2StartTime   = 0;  // when Stage 2 started
 bool ledState = false;
 
 // ============================================================================
-// HELPER FUNCTION: Set Motor Speeds
+// HELPER FUNCTION: Set Motor Speeds with Debug Output
 // ============================================================================
 void setMotorSpeeds(int leftSpeed, int rightSpeed) {
-  if (leftSpeed < 0) leftSpeed = 0;
-  if (leftSpeed > 255) leftSpeed = 255;
-  if (rightSpeed < 0) rightSpeed = 0;
-  if (rightSpeed > 255) rightSpeed = 255;
+  // Clamp speeds
+  leftSpeed = constrain(leftSpeed, 0, 255);
+  rightSpeed = constrain(rightSpeed, 0, 255);
+  
+  // Apply minimum speed threshold if motor should be moving
+  if (leftSpeed > 0 && leftSpeed < MIN_MOTOR_SPEED) {
+    leftSpeed = MIN_MOTOR_SPEED;
+  }
+  if (rightSpeed > 0 && rightSpeed < MIN_MOTOR_SPEED) {
+    rightSpeed = MIN_MOTOR_SPEED;
+  }
 
+  // Set speeds
   leftMotor.setSpeed(leftSpeed);
   rightMotor.setSpeed(rightSpeed);
 
+  // Run both forward
   leftMotor.run(FORWARD);
   rightMotor.run(FORWARD);
+  
+  // Debug output (occasional)
+  static unsigned long lastSpeedPrint = 0;
+  if (millis() - lastSpeedPrint >= 500) {
+    Serial.print("  [Motor speeds: L=");
+    Serial.print(leftSpeed);
+    Serial.print(" R=");
+    Serial.print(rightSpeed);
+    Serial.println("]");
+    lastSpeedPrint = millis();
+  }
 }
 
 // ============================================================================
@@ -105,7 +126,7 @@ void setup() {
   // Print Phase 5 banner
   Serial.println("================================================");
   Serial.println("  Phase 5: Advanced Line Following Robot");
-  Serial.println("  Soft/Hard Correction + Lost Line Recovery");
+  Serial.println("  ADJUSTED FOR BOTH MOTORS TO WORK IN SYNC");
   Serial.println("================================================");
   Serial.println();
   Serial.println("Hardware:");
@@ -113,18 +134,22 @@ void setup() {
   Serial.println("  - Right motor: M2");
   Serial.println("  - Line sensor: Pin 10 (digital)");
   Serial.println();
+  Serial.println("Speed Settings:");
+  Serial.println("  - MAX_SPEED:       255");
+  Serial.println("  - SOFT_TURN_SPEED: 220 (increased)");
+  Serial.println("  - HARD_TURN_SPEED: 190 (increased)");
+  Serial.println("  - MIN_MOTOR_SPEED: 150 (friction threshold)");
+  Serial.println();
   Serial.println("Drive Modes:");
   Serial.println("  STRAIGHT      - Both motors at base/max speed");
-  Serial.println("  SOFT_CORRECT  - Gentle turn (inner @ 190)");
-  Serial.println("  HARD_CORRECT  - Sharp turn (inner @ 140)");
+  Serial.println("  SOFT_CORRECT  - Gentle turn (L@220, R@255)");
+  Serial.println("  HARD_CORRECT  - Sharp turn (L@190, R@255)");
   Serial.println("  LOST_LINE     - Recovery spin search");
   Serial.println();
   Serial.println("Stages:");
   Serial.println("  Stage 0 (3s): Sensor warmup");
   Serial.println("  Stage 1 (2s): Countdown");
-  Serial.println("  Stage 2:      Line-following with");
-  Serial.println("                soft/hard correction and");
-  Serial.println("                lost-line recovery");
+  Serial.println("  Stage 2:      Line-following");
   Serial.println();
   
   // Initialize motor controller
@@ -252,14 +277,6 @@ void loop() {
       Serial.println("Countdown: 1");
       countdown1Printed = true;
     }
-    
-    // Announce Stage 2 is coming
-    static bool stage2AnnouncePrinted = false;
-    if (countdownElapsed >= 1800 && !stage2AnnouncePrinted) {
-      Serial.println();
-      Serial.println("Entering Stage 2 shortly...");
-      stage2AnnouncePrinted = true;
-    }
   }
   
   // ==========================================================================
@@ -276,11 +293,8 @@ void loop() {
       Serial.println();
       Serial.println("================================================");
       Serial.println("  Stage 2: Line Following Active!");
+      Serial.println("  Both motors synchronized for proper turning");
       Serial.println("================================================");
-      Serial.println("Features:");
-      Serial.println("  - Smooth speed ramp-up (0 to MAX over 800ms)");
-      Serial.println("  - Soft correction -> Hard correction");
-      Serial.println("  - Lost-line recovery with spin search");
       Serial.println();
       
       // Set Stage 2 timing
@@ -291,6 +305,9 @@ void loop() {
       
       stage2Initialized = true;
       lastSensorPrintTime = now;
+      
+      Serial.println("Motor speed commands will be shown every 500ms");
+      Serial.println();
     }
     
     // --- 1. READ SENSOR ---
@@ -306,8 +323,9 @@ void loop() {
     int baseSpeed;
     
     if (stage2Elapsed < RAMP_UP_MS) {
-      baseSpeed = map(stage2Elapsed, 0, RAMP_UP_MS, 0, MAX_SPEED);
-      baseSpeed = constrain(baseSpeed, 0, MAX_SPEED);
+      // Ramp up, but enforce minimum
+      baseSpeed = map(stage2Elapsed, 0, RAMP_UP_MS, MIN_MOTOR_SPEED, MAX_SPEED);
+      baseSpeed = constrain(baseSpeed, MIN_MOTOR_SPEED, MAX_SPEED);
     } else {
       baseSpeed = MAX_SPEED;
     }
@@ -327,7 +345,7 @@ void loop() {
     switch (mode) {
       
       case DRIVE_STRAIGHT:
-        // Both motors at baseSpeed
+        // Both motors at baseSpeed (synchronized)
         setMotorSpeeds(baseSpeed, baseSpeed);
         
         // Transition: saw tape
@@ -339,7 +357,7 @@ void loop() {
         break;
         
       case DRIVE_SOFT_CORRECT:
-        // Gentle left turn
+        // Gentle left turn: left slightly slower, but still strong
         setMotorSpeeds(SOFT_TURN_SPEED, baseSpeed);
         
         // Transition: escalate to hard correction
@@ -357,37 +375,41 @@ void loop() {
         break;
         
       case DRIVE_HARD_CORRECT:
-        // Stronger left turn
+        // Stronger left turn: bigger speed difference but both motors still powerful
         setMotorSpeeds(HARD_TURN_SPEED, baseSpeed);
         
         // After minimum time, check if we can exit
         if (inMode >= MIN_HARD_CORRECT_MS) {
           if (!onTape) {
-            mode = DRIVE_SOFT_CORRECT;
+            mode = DRIVE_STRAIGHT;
             modeStartTime = now;
-            Serial.println(">> Mode: SOFT_CORRECT (exiting hard correct)");
+            Serial.println(">> Mode: STRAIGHT (exiting hard correct)");
           }
         }
         break;
         
       case DRIVE_LOST_LINE:
-        // Recovery: spin in place (left forward, right backward)
-        leftMotor.setSpeed(HARD_TURN_SPEED);
-        rightMotor.setSpeed(HARD_TURN_SPEED);
-        leftMotor.run(FORWARD);
-        rightMotor.run(BACKWARD);
+        // Recovery: spin in place with HIGHER speeds for both motors
+        leftMotor.setSpeed(210);  // Higher speed for better spin
+        rightMotor.setSpeed(210); // Higher speed for better spin
+        leftMotor.run(FORWARD);   // Left forward
+        rightMotor.run(BACKWARD); // Right backward = spin left in place
+        
+        Serial.print("  [LOST_LINE spin: L=210 FWD, R=210 BWD]");
         
         // Transition: found tape
         if (onTape == 1) {
-          mode = DRIVE_SOFT_CORRECT;
+          mode = DRIVE_STRAIGHT;
           modeStartTime = now;
           tapeLastSeenTime = now;
-          Serial.println(">> LOST_LINE: found tape, switching to SOFT_CORRECT");
+          Serial.println(" >> Found tape! -> STRAIGHT");
         }
         // Still searching after recovery duration
         else if (inMode >= LOST_LINE_RECOVER_MS) {
           modeStartTime = now;  // Reset timer, keep searching
-          Serial.println(">> LOST_LINE: still searching...");
+          Serial.println(" >> Still searching...");
+        } else {
+          Serial.println();
         }
         break;
     }
